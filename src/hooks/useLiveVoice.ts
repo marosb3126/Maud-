@@ -544,9 +544,20 @@ export function useLiveVoice() {
           setStatus("error");
         };
 
-        ws.onclose = () => {
+        ws.onclose = (event) => {
           if (isConnectedRef.current) {
             stopSession();
+          } else if (wsRef.current === ws) {
+            cleanupResources();
+            const reason = event.reason
+              ? ` (${event.reason})`
+              : event.code
+                ? ` (code ${event.code})`
+                : "";
+            setErrorMessage(
+              `La connexion vocale avec Gemini Live a été fermée${reason}.`
+            );
+            setStatus("error");
           }
         };
       } catch (err) {

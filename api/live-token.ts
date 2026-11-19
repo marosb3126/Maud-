@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { GoogleGenAI, Modality } from "@google/genai";
-import { buildSystemInstruction } from "../lib/maudPrompt.js";
+import { buildSystemInstruction } from "./_maudPrompt.js";
 
 type VercelRequest = IncomingMessage & {
   method?: string;
@@ -13,6 +13,22 @@ type VercelResponse = ServerResponse & {
   json: (data: unknown) => void;
 };
 
+async function readBodyFallback(req: VercelRequest): Promise<Record<string, unknown>> {
+  if (req.body && typeof req.body === "object") {
+    return req.body as Record<string, unknown>;
+  }
+  if (typeof req.body === "string" && req.body.trim()) {
+    return JSON.parse(req.body) as Record<string, unknown>;
+  }
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+  }
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  if (!raw) return {};
+  return JSON.parse(raw) as Record<string, unknown>;
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST" && req.method !== "GET") {
     res.status(405).json({ error: "Method not allowed" });
@@ -23,18 +39,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!apiKey) {
     res.status(500).json({
       error:
-        "Clé GEMINI_API_KEY manquante dans les variables d'environnement du serveur.",
+        "Clé GEMINI_API_KEY manquante dans les variables d'environnement Vercel.",
     });
     return;
   }
 
   try {
-    let bodyObj: Record<string, unknown> = {};
-    if (req.body && typeof req.body === "object") {
-      bodyObj = req.body as Record<string, unknown>;
-    } else if (typeof req.body === "string" && req.body.trim()) {
-      bodyObj = JSON.parse(req.body) as Record<string, unknown>;
-    }
+    const bodyObj = req.method === "POST" ? await readBodyFallback(req) : {};
 
     const langParam =
       (typeof bodyObj.lang === "string" ? bodyObj.lang : undefined) ??

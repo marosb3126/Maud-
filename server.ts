@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
 import { GoogleGenAI, Modality } from "@google/genai";
 import type { LiveServerMessage } from "@google/genai";
-import { buildSystemInstruction } from "./lib/maudPrompt.js";
+import { buildSystemInstruction } from "./api/_maudPrompt.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
