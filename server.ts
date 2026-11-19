@@ -19,6 +19,7 @@ function getGeminiClient(): GoogleGenAI {
   }
   return new GoogleGenAI({
     apiKey,
+    apiVersion: "v1beta",
     httpOptions: {
       headers: {
         "User-Agent": "aistudio-build",
@@ -197,10 +198,14 @@ async function startServer() {
             }
           },
           onerror: (err: unknown) => {
+            console.error("Gemini Live error:", err);
+            const errObj = err as { message?: string; error?: { message?: string } };
             const msg =
               err instanceof Error
                 ? err.message
-                : "Erreur de connexion avec Gemini Live.";
+                : errObj?.error?.message ||
+                  errObj?.message ||
+                  "Erreur de connexion avec Gemini Live.";
             safeSend({ error: msg });
           },
           onclose: () => {
