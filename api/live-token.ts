@@ -95,17 +95,31 @@ async function readBodyFallback(req: VercelRequest): Promise<Record<string, unkn
   return JSON.parse(raw) as Record<string, unknown>;
 }
 
+function resolveApiKey(): string | undefined {
+  const candidates = [
+    process.env.GEMINI_API_KEY,
+    process.env.GOOGLE_API_KEY,
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY,
+    process.env.VITE_GEMINI_API_KEY,
+  ];
+  for (const val of candidates) {
+    const trimmed = val?.trim();
+    if (trimmed) return trimmed;
+  }
+  return undefined;
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST" && req.method !== "GET") {
     res.status(405).json({ error: "Method not allowed" });
     return;
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = resolveApiKey();
   if (!apiKey) {
     res.status(500).json({
       error:
-        "Clé GEMINI_API_KEY manquante dans les variables d'environnement Vercel.",
+        "Clé GEMINI_API_KEY manquante sur Vercel (Settings > Environment Variables > GEMINI_API_KEY, puis Redeploy).",
     });
     return;
   }

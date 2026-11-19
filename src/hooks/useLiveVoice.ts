@@ -341,7 +341,7 @@ export function useLiveVoice() {
             };
             if (health.hasApiKey === false) {
               throw new Error(
-                "La variable d'environnement GEMINI_API_KEY n'est pas configurée sur le serveur."
+                "La variable GEMINI_API_KEY est absente du serveur Vercel. Ajoutez-la dans Vercel > Settings > Environment Variables (Production), puis cliquez sur Redeploy."
               );
             }
             if (health.transport === "ws") {
