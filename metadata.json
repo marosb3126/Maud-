@@ -1,0 +1,6 @@
+{
+  "name": "Élise · Marion Server",
+  "description": "Assistant vocal professionnel trilingue pour présenter le profil et le parcours en commercial événementiel de Marion Server.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
