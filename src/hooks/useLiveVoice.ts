@@ -10,6 +10,8 @@ export interface TranscriptEntry {
   text: string;
 }
 
+type TransportMode = "ws" | "ephemeral";
+
 function float32ToBase64Pcm16(
   input: Float32Array,
   inputSampleRate: number,
@@ -64,6 +66,23 @@ function base64Pcm16ToFloat32(base64: string): Float32Array {
   return float32;
 }
 
+async function decodeWsData(data: unknown): Promise<string> {
+  if (typeof data === "string") return data;
+  if (data instanceof Blob) return data.text();
+  if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
+  return "";
+}
+
+function getDefaultGreeting(language: VoiceLanguage): string {
+  if (language === "en") {
+    return "The visitor just started the voice conversation. Greet them briefly and warmly in English as Maud, Marion Server's voice assistant.";
+  }
+  if (language === "es") {
+    return "El visitante acaba de iniciar la conversación de voz. Salúdale brevemente y con amabilidad en español como Maud, la asistente de voz de Marion Server.";
+  }
+  return "Le visiteur vient de lancer la conversation vocale. Accueille-le chaleureusement et brièvement en français en te présentant comme Maud, l'assistante vocale de Marion Server.";
+}
+
 export function useLiveVoice() {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [isMuted, setIsMuted] = useState(false);
@@ -72,6 +91,7 @@ export function useLiveVoice() {
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const transportModeRef = useRef<TransportMode>("ws");
   const inputAudioCtxRef = useRef<AudioContext | null>(null);
   const outputAudioCtxRef = useRef<AudioContext | null>(null);
   const outputAnalyserRef = useRef<AnalyserNode | null>(null);
@@ -219,6 +239,34 @@ export function useLiveVoice() {
     };
   }, []);
 
+  const sendWireText = useCallback(
+    (ws: WebSocket, text: string) => {
+      if (transportModeRef.current === "ephemeral") {
+        ws.send(JSON.stringify({ realtimeInput: { text } }));
+      } else {
+        ws.send(JSON.stringify({ text }));
+      }
+    },
+    []
+  );
+
+  const sendWireAudio = useCallback((ws: WebSocket, base64Audio: string) => {
+    if (transportModeRef.current === "ephemeral") {
+      ws.send(
+        JSON.stringify({
+          realtimeInput: {
+            audio: {
+              data: base64Audio,
+              mimeType: "audio/pcm;rate=16000",
+            },
+          },
+        })
+      );
+    } else {
+      ws.send(JSON.stringify({ audio: base64Audio }));
+    }
+  }, []);
+
   const sendTextPrompt = useCallback(
     (text: string) => {
       const trimmed = text.trim();
@@ -235,9 +283,9 @@ export function useLiveVoice() {
           text: trimmed,
         },
       ]);
-      ws.send(JSON.stringify({ text: trimmed }));
+      sendWireText(ws, trimmed);
     },
-    []
+    [sendWireText]
   );
 
   const startSession = useCallback(
@@ -281,13 +329,69 @@ export function useLiveVoice() {
         analyser.connect(outputCtx.destination);
         outputAnalyserRef.current = analyser;
 
-        const wsProtocol =
-          window.location.protocol === "https:" ? "wss:" : "ws:";
-        const wsUrl = `${wsProtocol}//${window.location.host}/live?lang=${language}&voice=${voice}`;
+        // Detect whether the host supports local WebSocket proxy (AI Studio / Node)
+        // or serverless ephemeral tokens (Vercel).
+        let mode: TransportMode = "ephemeral";
+        try {
+          const healthRes = await fetch("/api/health");
+          if (healthRes.ok) {
+            const health = (await healthRes.json()) as {
+              transport?: string;
+              hasApiKey?: boolean;
+            };
+            if (health.hasApiKey === false) {
+              throw new Error(
+                "La variable d'environnement GEMINI_API_KEY n'est pas configurée sur le serveur."
+              );
+            }
+            if (health.transport === "ws") {
+              mode = "ws";
+            }
+          }
+        } catch (healthErr) {
+          if (
+            healthErr instanceof Error &&
+            healthErr.message.includes("GEMINI_API_KEY")
+          ) {
+            throw healthErr;
+          }
+          mode = "ephemeral";
+        }
+
+        transportModeRef.current = mode;
+
+        let wsUrl: string;
+        let setupModel = "models/gemini-3.8-live";
+
+        if (mode === "ws") {
+          const wsProtocol =
+            window.location.protocol === "https:" ? "wss:" : "ws:";
+          wsUrl = `${wsProtocol}//${window.location.host}/live?lang=${language}&voice=${voice}`;
+        } else {
+          const tokenRes = await fetch("/api/live-token", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ lang: language, voice }),
+          });
+          const tokenData = (await tokenRes.json()) as {
+            token?: string;
+            model?: string;
+            error?: string;
+          };
+          if (!tokenRes.ok || !tokenData.token) {
+            throw new Error(
+              tokenData.error ||
+                "Impossible d'obtenir un jeton de session Gemini Live."
+            );
+          }
+          if (tokenData.model) setupModel = tokenData.model;
+          wsUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained?access_token=${encodeURIComponent(tokenData.token)}`;
+        }
+
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
 
-        ws.onopen = () => {
+        const attachAudioProcessor = () => {
           const source = inputCtx.createMediaStreamSource(stream);
           const processor = inputCtx.createScriptProcessor(4096, 1, 1);
           const silentGain = inputCtx.createGain();
@@ -321,13 +425,35 @@ export function useLiveVoice() {
               inputCtx.sampleRate,
               16000
             );
-            ws.send(JSON.stringify({ audio: base64Audio }));
+            sendWireAudio(ws, base64Audio);
           };
         };
 
-        ws.onmessage = (event) => {
+        const markSessionReady = () => {
+          isConnectedRef.current = true;
+          setStatus("connected");
+          if (pendingPromptRef.current) {
+            const promptToSend = pendingPromptRef.current;
+            pendingPromptRef.current = null;
+            sendWireText(ws, promptToSend);
+          } else {
+            sendWireText(ws, getDefaultGreeting(language));
+          }
+        };
+
+        ws.onopen = () => {
+          attachAudioProcessor();
+          if (mode === "ephemeral") {
+            ws.send(JSON.stringify({ setup: { model: setupModel } }));
+          }
+        };
+
+        ws.onmessage = async (event) => {
           try {
-            const msg = JSON.parse(event.data) as {
+            const rawText = await decodeWsData(event.data);
+            if (!rawText) return;
+            const msg = JSON.parse(rawText) as {
+              // Proxy WS format
               status?: string;
               audio?: string;
               inputTranscript?: string;
@@ -335,6 +461,17 @@ export function useLiveVoice() {
               interrupted?: boolean;
               turnComplete?: boolean;
               error?: string;
+              // Direct Gemini Live BidiGenerateContent format
+              setupComplete?: unknown;
+              serverContent?: {
+                inputTranscription?: { text?: string };
+                outputTranscription?: { text?: string };
+                modelTurn?: {
+                  parts?: Array<{ inlineData?: { data?: string } }>;
+                };
+                interrupted?: boolean;
+                turnComplete?: boolean;
+              };
             };
 
             if (msg.error) {
@@ -344,47 +481,55 @@ export function useLiveVoice() {
               return;
             }
 
-            if (msg.status === "connected") {
-              isConnectedRef.current = true;
-              setStatus("connected");
-              if (pendingPromptRef.current) {
-                const promptToSend = pendingPromptRef.current;
-                pendingPromptRef.current = null;
-                ws.send(JSON.stringify({ text: promptToSend }));
-              } else {
-                const defaultGreeting =
-                  language === "en"
-                    ? "The visitor just started the voice conversation. Greet them briefly and warmly in English as Maud, Marion Server's voice assistant."
-                    : language === "es"
-                      ? "El visitante acaba de iniciar la conversación de voz. Salúdale brevemente y con amabilidad en español como Maud, la asistente de voz de Marion Server."
-                      : "Le visiteur vient de lancer la conversation vocale. Accueille-le chaleureusement et brièvement en français en te présentant comme Maud, l'assistante vocale de Marion Server.";
-                ws.send(JSON.stringify({ text: defaultGreeting }));
+            if (msg.status === "connected" || msg.setupComplete) {
+              if (!isConnectedRef.current) {
+                markSessionReady();
               }
+              return;
             }
 
             if (msg.status === "disconnected") {
               stopSession();
+              return;
             }
 
-            if (msg.inputTranscript) {
-              appendTranscript("user", msg.inputTranscript);
-            }
-
-            if (msg.outputTranscript) {
-              appendTranscript("assistant", msg.outputTranscript);
-            }
-
-            if (msg.audio) {
-              playAudioChunk(msg.audio);
-            }
-
-            if (msg.interrupted) {
-              clearScheduledPlayback();
-              activeSpeakerRef.current = null;
-            }
-
-            if (msg.turnComplete) {
-              activeSpeakerRef.current = null;
+            if (mode === "ws") {
+              if (msg.inputTranscript) {
+                appendTranscript("user", msg.inputTranscript);
+              }
+              if (msg.outputTranscript) {
+                appendTranscript("assistant", msg.outputTranscript);
+              }
+              if (msg.audio) {
+                playAudioChunk(msg.audio);
+              }
+              if (msg.interrupted) {
+                clearScheduledPlayback();
+                activeSpeakerRef.current = null;
+              }
+              if (msg.turnComplete) {
+                activeSpeakerRef.current = null;
+              }
+            } else if (msg.serverContent) {
+              const sc = msg.serverContent;
+              if (sc.inputTranscription?.text) {
+                appendTranscript("user", sc.inputTranscription.text);
+              }
+              if (sc.outputTranscription?.text) {
+                appendTranscript("assistant", sc.outputTranscription.text);
+              }
+              for (const part of sc.modelTurn?.parts ?? []) {
+                if (part.inlineData?.data) {
+                  playAudioChunk(part.inlineData.data);
+                }
+              }
+              if (sc.interrupted) {
+                clearScheduledPlayback();
+                activeSpeakerRef.current = null;
+              }
+              if (sc.turnComplete) {
+                activeSpeakerRef.current = null;
+              }
             }
           } catch {
             // Ignore unparseable messages
@@ -394,7 +539,7 @@ export function useLiveVoice() {
         ws.onerror = () => {
           cleanupResources();
           setErrorMessage(
-            "La connexion temps réel avec le serveur vocal a été interrompue."
+            "La connexion temps réel avec Gemini Live a été interrompue."
           );
           setStatus("error");
         };
@@ -408,7 +553,9 @@ export function useLiveVoice() {
         const message =
           err instanceof Error && err.name === "NotAllowedError"
             ? "L'accès au microphone a été refusé. Veuillez l'autoriser dans votre navigateur pour parler avec Maud."
-            : "Impossible d'accéder au microphone ou d'établir la session vocale.";
+            : err instanceof Error && err.message
+              ? err.message
+              : "Impossible d'accéder au microphone ou d'établir la session vocale.";
         cleanupResources();
         setErrorMessage(message);
         setStatus("error");
@@ -419,6 +566,8 @@ export function useLiveVoice() {
       cleanupResources,
       clearScheduledPlayback,
       playAudioChunk,
+      sendWireAudio,
+      sendWireText,
       stopSession,
     ]
   );
